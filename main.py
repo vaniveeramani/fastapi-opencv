@@ -971,8 +971,11 @@ async def annotate(
             missing_labels.append(label)
 
     # prepare response
-    ok, buf = cv2.imencode(".jpg", annotated_img, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
-if not ok:
-    return JSONResponse(status_code=500, content={"error": "encode_failed"})
+   ok, buf = cv2.imencode(".jpg", defective_img, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+        if not ok:
+            return JSONResponse(status_code=500, content={"error": "encode_failed"})
 
-return StreamingResponse(io.BytesIO(buf.tobytes()), media_type="image/jpeg")
+        return StreamingResponse(io.BytesIO(buf.tobytes()), media_type="image/jpeg")
+
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
