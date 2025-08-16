@@ -1,14 +1,17 @@
+# main.py
 from fastapi import FastAPI, File, Form, UploadFile
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse
 import cv2
 import numpy as np
+import base64
 import json
 import io
+import os
 
-app = FastAPI()
+app = FastAPI(title="Annotate with alignment (ORB+Homography)")
 
 # -------------------------------
-# HARD-CODED GOOD JSON (your reference bonnet)
+# Hard-coded GOOD JSON (exactly as provided by you)
 # -------------------------------
 GOOD_JSON = {
   "predictions": [
@@ -774,66 +777,219 @@ GOOD_JSON = {
     }
   ]
 }
-        
 
 # -------------------------------
-# Utility: IOU for bounding box overlap
+# Configuration: reference image filename (put this file in repo root)
 # -------------------------------
-def iou(boxA, boxB):
-    xA = max(boxA[0], boxB[0])
-    yA = max(boxA[1], boxB[1])
-    xB = min(boxA[2], boxB[2])
-    yB = min(boxA[3], boxB[3])
-
-    interArea = max(0, xB - xA) * max(0, yB - yA)
-    if interArea == 0:
-        return 0.0
-
-    boxAArea = (boxA[2] - boxA[0]) * (boxA[3] - boxA[1])
-    boxBArea = (boxB[2] - boxB[0]) * (boxB[3] - boxB[1])
-
-    return interArea / float(boxAArea + boxBArea - interArea)
-
+REF_IMAGE_PATH = "good_ref.jpg"  # <-- add your GOOD reference image to repo with this name
 
 # -------------------------------
-# API Endpoint
+# Utilities
+# -------------------------------
+def center_to_xyxy_centerformat(box):
+    # box has center-format x,y,width,height -> convert to [x0,y0,x1,y1]
+    x, y, w, h = float(box["x"]), float(box["y"]), float(box["width"]), float(box["height"])
+    return [x - w/2.0, y - h/2.0, x + w/2.0, y + h/2.0]
+
+def iou_xyxy(a, b):
+    ax0, ay0, ax1, ay1 = a
+    bx0, by0, bx1, by1 = b
+    inter_x0 = max(ax0, bx0)
+    inter_y0 = max(ay0, by0)
+    inter_x1 = min(ax1, bx1)
+    inter_y1 = min(ay1, by1)
+    iw = max(0, inter_x1 - inter_x0)
+    ih = max(0, inter_y1 - inter_y0)
+    inter = iw * ih
+    area_a = max(0, ax1 - ax0) * max(0, ay1 - ay0)
+    area_b = max(0, bx1 - bx0) * max(0, by1 - by0)
+    union = area_a + area_b - inter
+    return inter / union if union > 0 else 0.0
+
+def encode_img_to_base64(img):
+    ok, buf = cv2.imencode(".jpg", img)
+    if not ok:
+        raise RuntimeError("encode failed")
+    return base64.b64encode(buf.tobytes()).decode("utf-8")
+
+# Load reference image once at startup
+if not os.path.exists(REF_IMAGE_PATH):
+    REF_IMG = None
+else:
+    REF_IMG = cv2.imread(REF_IMAGE_PATH)
+    if REF_IMG is None:
+        REF_IMG = None
+
+# -------------------------------
+# /annotate endpoint
 # -------------------------------
 @app.post("/annotate")
 async def annotate(
     file: UploadFile = File(...),
-    defective_json: str = Form(...)
+    defective_json: str = Form(...),
+    iou_threshold: float = Form(0.5)
 ):
-    # Read defective image
-    image_bytes = await file.read()
-    nparr = np.frombuffer(image_bytes, np.uint8)
-    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    """
+    - file: defective image (binary)
+    - defective_json: JSON string { "predictions": [...] } (Roboflow output for defective image)
+    - iou_threshold: float for deciding presence (default 0.5)
+    Returns:
+      { "annotated": "<base64>", "stats": {...}, "debug": {...} }
+    """
+    # read incoming image
+    img_bytes = await file.read()
+    arr = np.frombuffer(img_bytes, np.uint8)
+    defect_img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if defect_img is None:
+        return JSONResponse(status_code=400, content={"error":"Could not decode uploaded image."})
 
-    # Parse defective JSON
-    defective = json.loads(defective_json)
+    # parse defective_json
+    try:
+        defective_obj = json.loads(defective_json) if isinstance(defective_json, str) else defective_json
+        defective_preds = defective_obj.get("predictions", [])
+    except Exception as e:
+        return JSONResponse(status_code=400, content={"error":"defective_json parse failed", "detail": str(e)})
 
-    # Compare GOOD vs DEFECTIVE
-    for good_pred in GOOD_JSON["predictions"]:
-        gx, gy, gw, gh = good_pred["x"], good_pred["y"], good_pred["width"], good_pred["height"]
-        gclass = good_pred["class"]
+    # prepare GOOD preds (center->xyxy in reference image coords)
+    good_preds = GOOD_JSON.get("predictions", [])
+    good_xyxy = []
+    for g in good_preds:
+        box = center_to_xyxy_centerformat(g)
+        good_xyxy.append({"class": str(g.get("class")), "xyxy": box, "raw": g})
 
-        good_box = [gx - gw/2, gy - gh/2, gx + gw/2, gy + gh/2]
+    # Attempt alignment if we have a reference image
+    method_used = "none"
+    matches_count = 0
+    transformed_defective_preds = []  # will be list of dicts with class and xyxy in ref coords
 
-        found = False
-        for defect_pred in defective.get("predictions", []):
-            if defect_pred["class"] == gclass:
-                dx, dy, dw, dh = defect_pred["x"], defect_pred["y"], defect_pred["width"], defect_pred["height"]
-                defect_box = [dx - dw/2, dy - dh/2, dx + dw/2, dy + dh/2]
+    if REF_IMG is not None:
+        # 1. compute ORB features and match
+        try:
+            ref_gray = cv2.cvtColor(REF_IMG, cv2.COLOR_BGR2GRAY)
+            def_gray = cv2.cvtColor(defect_img, cv2.COLOR_BGR2GRAY)
+            orb = cv2.ORB_create(2000)
+            kp1, des1 = orb.detectAndCompute(ref_gray, None)
+            kp2, des2 = orb.detectAndCompute(def_gray, None)
 
-                if iou(good_box, defect_box) > 0.5:  # bounding box overlap
-                    found = True
+            if des1 is not None and des2 is not None and len(kp1) >= 10 and len(kp2) >= 10:
+                bf = cv2.BFMatcher_create(cv2.NORM_HAMMING, crossCheck=False)
+                knn = bf.knnMatch(des1, des2, k=2)
+                good_matches = []
+                for m,n in knn:
+                    # Lowe ratio test
+                    if m.distance < 0.75 * n.distance:
+                        good_matches.append(m)
+                matches_count = len(good_matches)
+
+                if matches_count >= 6:
+                    # build source/target pts for homography
+                    src_pts = np.float32([ kp1[m.queryIdx].pt for m in good_matches ]).reshape(-1,1,2)
+                    dst_pts = np.float32([ kp2[m.trainIdx].pt for m in good_matches ]).reshape(-1,1,2)
+                    H, mask = cv2.findHomography(dst_pts, src_pts, cv2.RANSAC, 5.0)  # map defective -> reference
+                    if H is not None:
+                        method_used = "homography"
+                        # transform each defective bounding box (four corners) into reference coordinate space
+                        for d in defective_preds:
+                            try:
+                                cx, cy, w, h = float(d["x"]), float(d["y"]), float(d["width"]), float(d["height"])
+                                x0 = cx - w/2.0
+                                y0 = cy - h/2.0
+                                x1 = cx + w/2.0
+                                y1 = cy + h/2.0
+                                corners = np.array([ [x0,y0],[x1,y0],[x1,y1],[x0,y1] ], dtype=np.float32).reshape(-1,1,2)
+                                warped = cv2.perspectiveTransform(corners, H)  # map to ref coords
+                                xs = warped[:,0,0]
+                                ys = warped[:,0,1]
+                                tx0, ty0, tx1, ty1 = float(xs.min()), float(ys.min()), float(xs.max()), float(ys.max())
+                                transformed_defective_preds.append({
+                                    "class": str(d.get("class")),
+                                    "xyxy": [tx0, ty0, tx1, ty1],
+                                    "raw": d
+                                })
+                            except Exception:
+                                continue
+                else:
+                    method_used = "not_enough_matches"
+            else:
+                method_used = "no_descriptors"
+        except Exception as e:
+            method_used = "orb_error"
+    else:
+        method_used = "no_ref_image"
+
+    # If homography failed, fallback to simple scale (map coordinates by image sizes)
+    if method_used not in ("homography",):
+        # fallback scale
+        ref_h, ref_w = REF_IMG.shape[:2] if REF_IMG is not None else (None, None)
+        def_h, def_w = defect_img.shape[:2]
+        if (ref_w is not None) and (def_w is not None) and def_w>0 and def_h>0:
+            sx = ref_w / float(def_w)
+            sy = ref_h / float(def_h)
+            method_used = "scale_fallback"
+            for d in defective_preds:
+                cx, cy, w, h = float(d["x"]), float(d["y"]), float(d["width"]), float(d["height"])
+                x0 = cx - w/2.0
+                y0 = cy - h/2.0
+                x1 = cx + w/2.0
+                y1 = cy + h/2.0
+                tx0, ty0, tx1, ty1 = x0*sx, y0*sy, x1*sx, y1*sy
+                transformed_defective_preds.append({
+                    "class": str(d.get("class")),
+                    "xyxy": [tx0, ty0, tx1, ty1],
+                    "raw": d
+                })
+        else:
+            method_used = "no_mapping_possible"
+
+    # Now compare GOOD boxes vs transformed defective boxes (only red boxes drawn for missing)
+    missing_labels = []
+    annotated_img = REF_IMG.copy() if REF_IMG is not None else defect_img.copy()  # show boxes on reference if available; else defective
+    total_expected = len(good_xyxy)
+    for g in good_xyxy:
+        gclass = g["class"]
+        gbox = g["xyxy"]  # [x0,y0,x1,y1] in reference coords
+        matched = False
+        # find any defective prediction of same class with IOU >= threshold
+        for td in transformed_defective_preds:
+            if td["class"] == gclass:
+                i = iou_xyxy(gbox, td["xyxy"])
+                if i >= float(iou_threshold):
+                    matched = True
                     break
+        if not matched:
+            # draw red box and label at GOOD location (convert floats to ints)
+            x0, y0, x1, y1 = int(round(gbox[0])), int(round(gbox[1])), int(round(gbox[2])), int(round(gbox[3]))
+            # clamp
+            h, w = annotated_img.shape[:2]
+            x0 = max(0, min(w-1, x0)); x1 = max(0, min(w-1, x1))
+            y0 = max(0, min(h-1, y0)); y1 = max(0, min(h-1, y1))
+            cv2.rectangle(annotated_img, (x0, y0), (x1, y1), (0,0,255), 3)
+            label = str(gclass)
+            ty = y0 - 8 if y0-8>8 else y0 + 12
+            font_scale = max(0.4, min(1.0, min(w,h)/1000))
+            cv2.putText(annotated_img, label, (x0, ty), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0,0,255), 2, cv2.LINE_AA)
+            missing_labels.append(label)
 
-        if not found:
-            # Draw red box at GOOD location (missing part)
-            pt1 = (int(good_box[0]), int(good_box[1]))
-            pt2 = (int(good_box[2]), int(good_box[3]))
-            cv2.rectangle(img, pt1, pt2, (0, 0, 255), 4)
+    # prepare response
+    try:
+        annotated_b64 = encode_img_to_base64(annotated_img)
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error":"encode_failed", "detail": str(e)})
 
-    # Encode image to return
-    _, img_encoded = cv2.imencode(".jpg", img)
-    return StreamingResponse(io.BytesIO(img_encoded.tobytes()), media_type="image/jpeg")
+    stats = {
+        "total_expected": total_expected,
+        "missing": len(missing_labels),
+        "iou_threshold": float(iou_threshold)
+    }
+    debug = {
+        "method_used": method_used,
+        "matches_count": matches_count,
+        "transformed_def_count": len(transformed_defective_preds)
+    }
+
+    return JSONResponse(content={
+        "annotated": annotated_b64,
+        "stats": stats,
+        "missing_labels": missing_labels,
+        "debug": debug
+    })
