@@ -987,9 +987,10 @@ async def annotate(
         "transformed_def_count": len(transformed_defective_preds)
     }
 
-    return JSONResponse(content={
-        "annotated": annotated_b64,
-        "stats": stats,
-        "missing_labels": missing_labels,
-        "debug": debug
+    ok, buf = cv2.imencode(".jpg", annotated_img, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+if not ok:
+    return JSONResponse(status_code=500, content={"error": "encode_failed"})
+
+return StreamingResponse(io.BytesIO(buf.tobytes()), media_type="image/jpeg")
+
     })
