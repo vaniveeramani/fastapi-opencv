@@ -971,26 +971,8 @@ async def annotate(
             missing_labels.append(label)
 
     # prepare response
-    try:
-        annotated_b64 = encode_img_to_base64(annotated_img)
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error":"encode_failed", "detail": str(e)})
-
-    stats = {
-        "total_expected": total_expected,
-        "missing": len(missing_labels),
-        "iou_threshold": float(iou_threshold)
-    }
-    debug = {
-        "method_used": method_used,
-        "matches_count": matches_count,
-        "transformed_def_count": len(transformed_defective_preds)
-    }
-
     ok, buf = cv2.imencode(".jpg", annotated_img, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
 if not ok:
     return JSONResponse(status_code=500, content={"error": "encode_failed"})
 
 return StreamingResponse(io.BytesIO(buf.tobytes()), media_type="image/jpeg")
-
-    })
